@@ -73,20 +73,20 @@ export const denied = (why: string) =>
 
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
-// 距重置还有多久：≥1 天显示天+小时，否则小时+分钟
-export function untilReset(resetsAt: string | undefined, now: number) {
-  const ms = resetsAt ? Date.parse(resetsAt) - now : NaN
-  if (!(ms > 0)) return ''
-  const m = Math.round(ms / 60000)
-  const d = Math.floor(m / 1440)
-  const h = Math.floor((m % 1440) / 60)
-  return d ? `${d}天${h}时后重置` : h ? `${h}时${m % 60}分后重置` : `${m % 60}分后重置`
+// 重置的具体时间点（本地时区）：当天 "15:00"，次日 "明天 05:00"，更远 "10/17 05:00"
+export function resetAt(resetsAt: string | undefined, now: number) {
+  const t = resetsAt ? new Date(resetsAt) : undefined
+  if (!t || !(t.getTime() > now)) return ''
+  const hm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`
+  const day = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const days = Math.round((day(t) - day(new Date(now))) / 86400000)
+  return days === 0 ? hm : days === 1 ? `明天 ${hm}` : `${t.getMonth() + 1}/${t.getDate()} ${hm}`
 }
 
 const quota = (name: string, q: Quota | undefined, now: number) => {
   if (!q) return ''
-  const left = untilReset(q.resetsAt, now)
-  return `${name} ${Math.round(q.percent)}%${left ? `（${left}）` : ''}`
+  const at = resetAt(q.resetsAt, now)
+  return `${name} ${Math.round(q.percent)}%${at ? `（${at} 重置）` : ''}`
 }
 
 // 从 rateLimits 里分出 5 小时窗口和周窗口

@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 
-import { crossed, danger, mergeUsage, parseConfig, quotas, shellArgv, tail, untilReset, usageLine, usageColor } from './dev'
+import { crossed, danger, mergeUsage, parseConfig, quotas, shellArgv, tail, resetAt, usageLine, usageColor } from './dev'
 
 const bash = (command: string) => danger('Bash', { command })
 
@@ -64,23 +64,25 @@ test('检查配置解析与 shell 选择', () => {
 
 test('用量显示与阈值提醒', () => {
   expect(usageLine(null)).toBe('')
-  const now = Date.parse('2026-10-10T00:00:00Z')
+  // 用本地时间构造，换时区跑也成立
+  const local = (d: number, h: number, m = 0) => new Date(2026, 9, d, h, m)
+  const now = local(10, 9).getTime()
   const q = quotas([
-    { kind: 'five_hour', percentUsed: 30, resetsAt: '2026-10-10T02:15:00Z' },
-    { kind: 'seven_day', percentUsed: 12.4, resetsAt: '2026-10-13T05:00:00Z' },
+    { kind: 'five_hour', percentUsed: 30, resetsAt: local(10, 11, 15).toISOString() },
+    { kind: 'seven_day', percentUsed: 12.4, resetsAt: local(13, 5).toISOString() },
   ])
   expect(usageLine({ percent: 45.4, tokens: 90000, window: 200000, usd: 0.321, ...q }, now)).toBe(
-    '上下文 45%（90k/200k） · $0.32 · 5h额度 30%（2时15分后重置） · 周额度 12%（3天5时后重置）',
+    '上下文 45%（90k/200k） · $0.32 · 5h额度 30%（11:15 重置） · 周额度 12%（10/13 05:00 重置）',
   )
   // 没有订阅额度数据时不显示
   expect(usageLine({ percent: 10, window: 200000, ...quotas([]) }, now)).toBe('上下文 10%')
-  expect(untilReset('2026-10-10T00:40:00Z', now)).toBe('40分后重置')
-  expect(untilReset('2026-10-09T00:00:00Z', now)).toBe('')
+  expect(resetAt(local(11, 5).toISOString(), now)).toBe('明天 05:00')
+  expect(resetAt(local(9, 5).toISOString(), now)).toBe('')
   // resume 后的读数不带额度：沿用旧值；已过重置时间的旧值丢弃
   const fresh = { percent: 5, window: 200000 }
   const kept = mergeUsage({ window: 200000, ...q }, fresh, now)
   expect([kept.percent, kept.fiveHour?.percent, kept.week?.percent]).toEqual([5, 30, 12.4])
-  const later = Date.parse('2026-10-10T03:00:00Z')
+  const later = local(10, 12).getTime()
   const expired = mergeUsage({ window: 200000, ...q }, fresh, later)
   expect([expired.fiveHour, expired.week?.percent]).toEqual([undefined, 12.4])
   // 新读数带了额度就用新的
