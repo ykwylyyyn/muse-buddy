@@ -1,9 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Buddy, Mood } from '../types'
+import type { Buddy, Mood, Task } from '../types'
+import { applyTool, openTasks, reminder, window } from './tasks'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
+const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
 
 // 全身帧：11 行 × 24 列，纯 ASCII 保证对齐；String.raw 免转义
 export const W = 24
@@ -183,7 +185,13 @@ export function runs(row: string, colorAt: (ch: string, col: number) => string) 
   return out
 }
 
-export const dots = (frame: number) => '.'.repeat((frame >> 1) % 4)
+const TASK_LOOK: Record<Task['status'], { icon: string; color: string }> = {
+  completed: { icon: '✔', color: '#5fd787' },
+  in_progress: { icon: '▶', color: '#ffd75f' },
+  pending: { icon: '○', color: '#bcbcbc' },
+}
+
+export const dots =(frame: number) => '.'.repeat((frame >> 1) % 4)
 
 let tick: Timer | undefined
 let rest: Timer | undefined
@@ -203,6 +211,20 @@ function rest4s($: EngineInterface) {
   rest = $.clock.after(4000, () => setMood($, 'idle'))
 }
 
+// 同一轮最多把 agent 推回去几次，防止它卡住时无限循环
+const MAX_NAGS = 3
+let nags = 0
+
+// 不信缓存：直接调 TaskList 看真实状态；没有这个工具（只用 TodoWrite 的会话）就沿用记下的表
+async function syncTasks($: EngineInterface) {
+  try {
+    const r = await $.tool.call({ tool: 'TaskList' })
+    if (!r.isError && !r.deny) await update($, tasks, ts => applyTool(ts, 'TaskList', {}, r.result))
+  } catch {
+    // 工具不存在或被中断：用已记录的清单判断
+  }
+}
+
 export const register: Register = on => {
   on('session.start', ($, e, next) => {
     animate($)
@@ -214,11 +236,33 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    nags = 0
+    // 上一批全做完了，新一轮清空
+    if (openTasks(await read($, tasks)).length === 0) await update($, tasks, () => [])
+    return next(e)
+  })
+
   on('tool.call', async ($, e, next) => {
-    await setMood($, 'tool', e.tool)
+    // 自己在 Stop 时实查用的 TaskList 不算小人的动作
+    const quiet = e.tool === 'TaskList'
+    if (!quiet) await setMood($, 'tool', e.tool)
     const result = await next(e)
-    await (result.isError ? setMood($, 'error', e.tool) : setMood($, 'thinking'))
+    if (!result.isError && !result.deny) await update($, tasks, ts => applyTool(ts, e.tool, e, result.result))
+    if (!quiet) await (result.isError ? setMood($, 'error', e.tool) : setMood($, 'thinking'))
     return result
+  })
+
+  // agent 想停下时实际查一遍清单，有漏的就把它推回去继续做
+  on('classic.Stop', async ($, e, next) => {
+    const r = await next(e)
+    if (r.block) return r
+    await syncTasks($)
+    const open = openTasks(await read($, tasks))
+    if (open.length === 0 || nags >= MAX_NAGS) return r
+    nags += 1
+    $.ui.toast(`提醒 agent：还有 ${open.length} 项未完成（第 ${nags}/${MAX_NAGS} 次）`)
+    return { ...r, block: reminder(open) }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -243,23 +287,61 @@ export const register: Register = on => {
         </Text>
       ))
 
+    const list = await read($, tasks)
+    const done = list.length - openTasks(list).length
+    const tally = list.length ? `任务 ${done}/${list.length}` : ''
+
     // 高度不够时退回单行：只显示脸
     if (e.props.maxRows < body.length) {
       return (
         <Box justifyContent="flex-end" width={e.props.bodyColumns}>
-          <Text dimColor>{line} </Text>
+          <Text dimColor>
+            {tally ? `${tally} · ` : ''}
+            {line}{' '}
+          </Text>
           <Text>{paint(body[3] ?? '', 3)}</Text>
         </Box>
       )
     }
 
+    // 左侧清单：表头 + 至多 9 项 + 省略行，正好不高于小人的 11 行
+    const shown = window(list, 9)
+    const hidden = list.length - shown.length
+    const checklist = (
+      <Box key="tasks" flexDirection="column" flexShrink={1}>
+        <Text bold color="#5fd7ff">
+          {tally}
+          {nags ? `  · 已提醒 agent ${nags} 次` : ''}
+        </Text>
+        {shown.map(t => (
+          <Text
+            key={t.id}
+            wrap="truncate-end"
+            color={TASK_LOOK[t.status].color}
+            dimColor={t.status === 'completed'}
+            strikethrough={t.status === 'completed'}
+          >
+            {TASK_LOOK[t.status].icon} {t.subject}
+          </Text>
+        ))}
+        {hidden ? <Text dimColor>… 共 {list.length} 项，另有 {hidden} 项未显示</Text> : ''}
+      </Box>
+    )
+
     return (
-      <Box justifyContent="flex-end" alignItems="center" width={e.props.bodyColumns}>
-        <Text color={face.color}>{line} </Text>
-        <Box flexDirection="column">
-          {body.map((row, i) => (
-            <Text key={String(i)}>{paint(row, i)}</Text>
-          ))}
+      <Box
+        justifyContent={list.length ? 'space-between' : 'flex-end'}
+        alignItems="flex-end"
+        width={e.props.bodyColumns}
+      >
+        {list.length ? checklist : ''}
+        <Box key="buddy" alignItems="center" flexShrink={0}>
+          <Text color={face.color}>{line} </Text>
+          <Box flexDirection="column">
+            {body.map((row, i) => (
+              <Text key={String(i)}>{paint(row, i)}</Text>
+            ))}
+          </Box>
         </Box>
       </Box>
     )
