@@ -1,11 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Buddy, Mood, Task } from '../types'
+import type { Buddy, Mood, Task, Usage } from '../types'
 import { applyTool, openTasks, reminder, summary, window } from './tasks'
+import { EDIT_TOOLS, checkFailed, crossed, danger, denied, parseConfig, shellArgv, usageColor, usageLine } from './dev'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
 const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
+const usage = atom({ plugin: 'muse-buddy', key: 'usage' } as const, null as Usage | null)
 
 // 全身帧：11 行 × 24 列，纯 ASCII 保证对齐；String.raw 免转义
 export const W = 24
@@ -252,7 +254,43 @@ async function syncTasks($: EngineInterface) {
   }
 }
 
+// 本轮之后改过代码、检查还没通过
+let isDirty = false
+let checkNags = 0
+
+// 跑项目配置的检查命令；没配置或没改过代码就跳过。返回失败时给 agent 的说明
+async function runCheck($: EngineInterface, cwd: string): Promise<string | undefined> {
+  if (!isDirty) return undefined
+  const path = '.claude/muse-buddy.json'
+  const config = parseConfig((await $.fs.exists(path)) ? String(await $.fs.read(path)) : undefined)
+  if (!config.check) return undefined
+  $.ui.toast(`正在检查：${config.check}`)
+  try {
+    const r = await $.process.run(shellArgv(config.check, cwd), { cwd, timeoutMs: (config.timeoutSec ?? 300) * 1000 })
+    if (r.exitCode === 0) {
+      isDirty = false
+      $.ui.toast('检查通过 ✔')
+      return undefined
+    }
+    return checkFailed(config.check, r.exitCode, `${r.stdout}
+${r.stderr}`)
+  } catch (err) {
+    return checkFailed(config.check, -1, `检查命令没能跑完（超时或无法启动）：${String(err)}`)
+  }
+}
+
 export const register: Register = on => {
+  // 功能3：用量变化时记下，跨过 80% / 90% 提醒
+  on('session.measure', async ($, e, next) => {
+    const before = await read($, usage)
+    const limit = e.rateLimits.length ? Math.max(...e.rateLimits.map(l => l.percentUsed)) : undefined
+    const now: Usage = { percent: e.context.percent, tokens: e.context.tokens, window: e.context.window, usd: e.cost?.usd, limit }
+    await update($, usage, () => now)
+    const t = crossed(before?.percent, now.percent)
+    if (t) $.ui.toast(`上下文已用 ${t}%：建议先 /compact 压缩或开新会话`)
+    return next(e)
+  })
+
   on('session.start', async ($, e, next) => {
     animate($)
     // 很多会话没有 TodoWrite / TaskCreate，自带一个记任务的工具
@@ -267,12 +305,19 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     nags = 0
+    checkNags = 0
     // 上一批全做完了，新一轮清空
     if (openTasks(await read($, tasks)).length === 0) await update($, tasks, () => [])
     return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
+    // 功能2：危险命令、密钥文件直接拒绝
+    const why = danger(e.tool, e as unknown as Record<string, unknown>)
+    if (why) {
+      $.ui.toast(`已拦截 ${e.tool}：${why}`)
+      return { deny: denied(why) }
+    }
     // 自带任务工具：整表替换，回给模型当前清单（名字是运行时注册的，不在内置工具类型里）
     if ((e.tool as string) === TASKS_TOOL_ID) {
       const list = await update($, tasks, ts => applyTool(ts, 'TodoWrite', e, {}))
@@ -283,8 +328,14 @@ export const register: Register = on => {
     if (!quiet) await setMood($, 'tool', e.tool)
     const result = await next(e)
     if (!result.isError && !result.deny) await update($, tasks, ts => applyTool(ts, e.tool, e, result.result))
+    if (!result.isError && !result.deny && EDIT_TOOLS.has(e.tool)) isDirty = true
     if (!quiet) await (result.isError ? setMood($, 'error', e.tool) : setMood($, 'thinking'))
     return result
+  }).catch(($, e, next) => {
+    // 钩子出错时守卫仍然生效：危险的照样拒，其余放行
+    if (next.called) return next(e)
+    const why = danger(e.tool, e as unknown as Record<string, unknown>)
+    return why ? { deny: denied(why) } : next(e)
   })
 
   // agent 想停下时实际查一遍清单，有漏的就把它推回去继续做
@@ -293,10 +344,18 @@ export const register: Register = on => {
     if (r.block) return r
     await syncTasks($)
     const open = openTasks(await read($, tasks))
-    if (open.length === 0 || nags >= MAX_NAGS) return r
-    nags += 1
-    $.ui.toast(`提醒 agent：还有 ${open.length} 项未完成（第 ${nags}/${MAX_NAGS} 次）`)
-    return { ...r, block: reminder(open) }
+    if (open.length && nags < MAX_NAGS) {
+      nags += 1
+      $.ui.toast(`提醒 agent：还有 ${open.length} 项未完成（第 ${nags}/${MAX_NAGS} 次）`)
+      return { ...r, block: reminder(open) }
+    }
+    // 功能1：清单没问题了，再看改过的代码能不能过检查
+    if (checkNags >= MAX_NAGS) return r
+    const failure = await runCheck($, e.cwd)
+    if (!failure) return r
+    checkNags += 1
+    $.ui.toast(`检查没通过，已推回 agent 修复（第 ${checkNags}/${MAX_NAGS} 次）`)
+    return { ...r, block: failure }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -322,6 +381,8 @@ export const register: Register = on => {
       ))
 
     const list = await read($, tasks)
+    const u = await read($, usage)
+    const meter = usageLine(u)
     const done = list.length - openTasks(list).length
     const tally = list.length ? `任务 ${done}/${list.length}` : ''
 
@@ -330,6 +391,7 @@ export const register: Register = on => {
       return (
         <Box justifyContent="flex-end" width={e.props.bodyColumns}>
           <Text dimColor>
+            {meter ? `${meter} · ` : ''}
             {tally ? `${tally} · ` : ''}
             {line}{' '}
           </Text>
@@ -338,11 +400,18 @@ export const register: Register = on => {
       )
     }
 
-    // 左侧清单：表头 + 至多 9 项 + 省略行，正好不高于小人的 11 行
-    const shown = window(list, 9)
+    // 左栏：用量 + 表头 + 至多 8 项 + 省略行，正好不高于小人的 11 行
+    const shown = window(list, 8)
     const hidden = list.length - shown.length
     const checklist = (
       <Box key="tasks" flexDirection="column" flexShrink={1}>
+        {meter ? (
+          <Text color={usageColor(u)} wrap="truncate-end">
+            {meter}
+          </Text>
+        ) : (
+          ''
+        )}
         <Text bold color="#5fd7ff">
           {tally}
           {nags ? `  · 已提醒 agent ${nags} 次` : ''}
@@ -364,11 +433,11 @@ export const register: Register = on => {
 
     return (
       <Box
-        justifyContent={list.length ? 'space-between' : 'flex-end'}
+        justifyContent={list.length || meter ? 'space-between' : 'flex-end'}
         alignItems="flex-end"
         width={e.props.bodyColumns}
       >
-        {list.length ? checklist : ''}
+        {list.length || meter ? checklist : ''}
         <Box key="buddy" alignItems="center" flexShrink={0}>
           <Text color={face.color}>{line} </Text>
           <Box flexDirection="column">
