@@ -1,12 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Buddy, Mood, Task, Usage } from '../types'
-import { applyTool, openTasks, reminder, summary, window } from './tasks'
+import type { AgentRun, Buddy, Mood, Task, Usage } from '../types'
+import { agentLinked, agentReturned, agentStarted, agentStopped, applyTool, openTasks, reminder, rows, summary, window } from './tasks'
 import { EDIT_TOOLS, NOTIFY_AFTER_SEC, checkFailed, crossed, danger, denied, isWindowsPath, mergeUsage, notifyArgv, notifyText, parseConfig, quotas, shellArgv, usageColor, usageLine } from './dev'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
 const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
+const agents = atom({ plugin: 'muse-buddy', key: 'agents' } as const, [] as AgentRun[])
+const subTasks = atom({ plugin: 'muse-buddy', key: 'subTasks' } as const, {} as Record<string, Task[]>)
 const usage = atom({ plugin: 'muse-buddy', key: 'usage' } as const, null as Usage | null)
 
 // 全身帧：11 行 × 24 列，纯 ASCII 保证对齐；String.raw 免转义
@@ -243,6 +245,15 @@ const TASKS_TOOL = {
 // 同一轮最多把 agent 推回去几次，防止它卡住时无限循环
 const MAX_NAGS = 3
 let nags = 0
+// 每个子 agent 各自的提醒次数
+const subNags = new Map<string, number>()
+
+// 任务类工具：主对话的进主清单，子 agent 的按 agentId 各记一份，互不覆盖
+async function applyTasks($: EngineInterface, agentId: string | undefined, tool: string, input: unknown, result: unknown) {
+  if (!agentId) return update($, tasks, ts => applyTool(ts, tool, input, result))
+  const all = await update($, subTasks, m => ({ ...m, [agentId]: applyTool(m[agentId] ?? [], tool, input, result) }))
+  return all[agentId] ?? []
+}
 
 // 不信缓存：直接调 TaskList 看真实状态；没有这个工具（只用 TodoWrite 的会话）就沿用记下的表
 async function syncTasks($: EngineInterface) {
@@ -347,8 +358,15 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     nags = 0
     checkNags = 0
-    // 上一批全做完了，新一轮清空
-    if (openTasks(await read($, tasks)).length === 0) await update($, tasks, () => [])
+    subNags.clear()
+    // 上一批全做完了，新一轮清空；子 agent 只留还在后台跑的
+    if (openTasks(await read($, tasks)).length === 0) {
+      await update($, tasks, () => [])
+      const running = (await read($, agents)).filter(r => r.status === 'in_progress')
+      const keep = new Set(running.map(r => r.agentId))
+      await update($, agents, () => running)
+      await update($, subTasks, m => Object.fromEntries(Object.entries(m).filter(([id]) => keep.has(id))))
+    }
     return next(e)
   })
 
@@ -361,14 +379,18 @@ export const register: Register = on => {
     }
     // 自带任务工具：整表替换，回给模型当前清单（名字是运行时注册的，不在内置工具类型里）
     if ((e.tool as string) === TASKS_TOOL_ID) {
-      const list = await update($, tasks, ts => applyTool(ts, 'TodoWrite', e, {}))
+      const list = await applyTasks($, e.agentId, 'TodoWrite', e, {})
       return { result: summary(list) }
     }
+    // 派出子 agent：面板先挂一条运行中，返回后按结果打勾或等后台结束
+    const callId = e.tool === 'Agent' ? e.tool_use_id || `agent-${Date.now()}` : ''
+    if (e.tool === 'Agent') await update($, agents, rs => agentStarted(rs, callId, e.description))
     // 自己在 Stop 时实查用的 TaskList 不算小人的动作
     const quiet = e.tool === 'TaskList'
     if (!quiet) await setMood($, 'tool', e.tool)
     const result = await next(e)
-    if (!result.isError && !result.deny) await update($, tasks, ts => applyTool(ts, e.tool, e, result.result))
+    if (e.tool === 'Agent') await update($, agents, rs => agentReturned(rs, callId, result.result, !!(result.isError || result.deny)))
+    if (!result.isError && !result.deny) await applyTasks($, e.agentId, e.tool, e, result.result)
     if (!result.isError && !result.deny && EDIT_TOOLS.has(e.tool)) isDirty = true
     if (!quiet) await (result.isError ? setMood($, 'error', e.tool) : setMood($, 'thinking'))
     return result
@@ -377,6 +399,26 @@ export const register: Register = on => {
     if (next.called) return next(e)
     const why = danger(e.tool, e as unknown as Record<string, unknown>)
     return why ? { deny: denied(why) } : next(e)
+  })
+
+  on('classic.SubagentStart', async ($, e, next) => {
+    await update($, agents, rs => agentLinked(rs, e.agent_id))
+    return next(e)
+  })
+
+  // 子 agent 想结束时同样查它自己的清单；没问题就在面板上打勾
+  on('classic.SubagentStop', async ($, e, next) => {
+    const r = await next(e)
+    if (r.block) return r
+    const open = openTasks((await read($, subTasks))[e.agent_id] ?? [])
+    const n = subNags.get(e.agent_id) ?? 0
+    if (open.length && n < MAX_NAGS) {
+      subNags.set(e.agent_id, n + 1)
+      $.ui.toast(`提醒子 agent：还有 ${open.length} 项未完成（第 ${n + 1}/${MAX_NAGS} 次）`)
+      return { ...r, block: reminder(open) }
+    }
+    await update($, agents, rs => agentStopped(rs, e.agent_id))
+    return r
   })
 
   // agent 想停下时实际查一遍清单，有漏的就把它推回去继续做
@@ -430,8 +472,16 @@ export const register: Register = on => {
     const u = await read($, usage)
     // 只有要算“几时后重置”时才读时钟
     const meter = usageLine(u, u?.fiveHour?.resetsAt || u?.week?.resetsAt ? await $.clock.now() : 0)
+    const agentRuns = await read($, agents)
+    const all = rows(list, agentRuns, await read($, subTasks))
     const done = list.length - openTasks(list).length
-    const tally = list.length ? `任务 ${done}/${list.length}` : ''
+    const running = agentRuns.filter(r => r.status === 'in_progress').length
+    const tally = [
+      list.length ? `任务 ${done}/${list.length}` : '',
+      agentRuns.length ? `子 agent ${running ? `${running} 个运行中` : '全部结束'}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
 
     // 高度不够时退回单行：只显示脸
     if (e.props.maxRows < body.length) {
@@ -448,8 +498,8 @@ export const register: Register = on => {
     }
 
     // 左栏：用量 + 表头 + 至多 8 项 + 省略行，正好不高于小人的 11 行
-    const shown = window(list, 8)
-    const hidden = list.length - shown.length
+    const shown = window(all, 8)
+    const hidden = all.length - shown.length
     const checklist = (
       <Box key="tasks" flexDirection="column" flexShrink={1}>
         {meter ? (
@@ -465,26 +515,27 @@ export const register: Register = on => {
         </Text>
         {shown.map(t => (
           <Text
-            key={t.id}
+            key={t.key}
             wrap="truncate-end"
-            color={TASK_LOOK[t.status].color}
+            color={t.isAgent && t.status === 'in_progress' ? '#d7afff' : TASK_LOOK[t.status].color}
             dimColor={t.status === 'completed'}
-            strikethrough={t.status === 'completed'}
+            strikethrough={t.status === 'completed' && !t.isAgent}
           >
-            {TASK_LOOK[t.status].icon} {t.subject}
+            {t.depth ? '  └ ' : ''}
+            {t.isAgent && t.status === 'in_progress' ? '◆' : TASK_LOOK[t.status].icon} {t.subject}
           </Text>
         ))}
-        {hidden ? <Text dimColor>… 共 {list.length} 项，另有 {hidden} 项未显示</Text> : ''}
+        {hidden ? <Text dimColor>… 共 {all.length} 项，另有 {hidden} 项未显示</Text> : ''}
       </Box>
     )
 
     return (
       <Box
-        justifyContent={list.length || meter ? 'space-between' : 'flex-end'}
+        justifyContent={all.length || meter ? 'space-between' : 'flex-end'}
         alignItems="flex-end"
         width={e.props.bodyColumns}
       >
-        {list.length || meter ? checklist : ''}
+        {all.length || meter ? checklist : ''}
         <Box key="buddy" alignItems="center" flexShrink={0}>
           <Text color={face.color}>{line} </Text>
           <Box flexDirection="column">
