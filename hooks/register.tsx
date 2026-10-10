@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Buddy, Mood, Task, Usage } from '../types'
 import { applyTool, openTasks, reminder, summary, window } from './tasks'
-import { EDIT_TOOLS, checkFailed, crossed, danger, denied, mergeUsage, parseConfig, quotas, shellArgv, usageColor, usageLine } from './dev'
+import { EDIT_TOOLS, NOTIFY_AFTER_SEC, checkFailed, crossed, danger, denied, isWindowsPath, mergeUsage, notifyArgv, notifyText, parseConfig, quotas, shellArgv, usageColor, usageLine } from './dev'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
 const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
@@ -278,6 +278,15 @@ async function recordUsage($: EngineInterface, r: Reading) {
   return { before, after }
 }
 
+// 会话目录，用来判断是不是 Windows（mod 环境拿不到平台信息）
+let sessionCwd = ''
+
+// 功能4：不等通知进程结束（Windows 气泡要停留 8 秒），失败也不影响会话
+function notify($: EngineInterface, title: string, body: string) {
+  $.ui.toast(`${title}：${body}`)
+  $.process.run(notifyArgv(title, body, isWindowsPath(sessionCwd)), { timeoutMs: 15000 }).catch(() => undefined)
+}
+
 // 本轮之后改过代码、检查还没通过
 let isDirty = false
 let checkNags = 0
@@ -318,6 +327,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     animate($)
+    sessionCwd = e.cwd
     // 很多会话没有 TodoWrite / TaskCreate，自带一个记任务的工具
     await $.tool.register(TASKS_TOOL)
     // resume 时引擎不一定马上推送用量：先主动读一次，读不到额度就用上次存下的
@@ -392,6 +402,11 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     await (e.reason === 'answer' ? setMood($, 'done') : setMood($, 'error'))
     rest4s($)
+    // 主对话里超过 NOTIFY_AFTER_SEC 的回复，结束时发系统通知；子 agent 的不算
+    if (!e.agentId && e.durationMs >= NOTIFY_AFTER_SEC * 1000) {
+      const { title, body } = notifyText(e.answer, e.durationMs, e.reason)
+      notify($, title, body)
+    }
     return next(e)
   })
 

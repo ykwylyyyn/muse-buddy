@@ -20,8 +20,11 @@ export function parseConfig(text: string | undefined): CheckConfig {
 }
 
 // $.process.run 不走 shell，命令串交给系统 shell 解释（&&、管道、pnpm.cmd 都能用）
+// mod 环境拿不到平台信息，看会话目录是不是盘符路径
+export const isWindowsPath = (cwd: string) => /^[A-Za-z]:[\\/]/.test(cwd)
+
 export const shellArgv = (cmd: string, cwd: string) =>
-  /^[A-Za-z]:[\\/]/.test(cwd) ? ['cmd.exe', '/d', '/s', '/c', cmd] : ['sh', '-c', cmd]
+  isWindowsPath(cwd) ? ['cmd.exe', '/d', '/s', '/c', cmd] : ['sh', '-c', cmd]
 
 // 只取输出结尾，报错一般在最后
 export const tail = (text: string, lines = 60) => text.trimEnd().split(/\r?\n/).slice(-lines).join('\n')
@@ -128,4 +131,40 @@ export const crossed = (before: number | undefined, after: number | undefined) =
 export const usageColor = (u: Usage | null) => {
   const worst = Math.max(u?.percent ?? 0, u?.fiveHour?.percent ?? 0, u?.week?.percent ?? 0)
   return worst >= 90 ? '#ff5f5f' : worst >= 80 ? '#ffaf00' : '#8a8a8a'
+}
+
+// ---------- 功能4：长任务完成通知 ----------
+
+// 超过这么久的回复才通知（秒）
+export const NOTIFY_AFTER_SEC = 60
+
+export function formatDuration(ms: number) {
+  const s = Math.round(ms / 1000)
+  const m = Math.floor(s / 60)
+  return m ? `${m}分${s % 60}秒` : `${s}秒`
+}
+
+// 通知正文：用时 + 回答开头一句
+export function notifyText(answer: string, durationMs: number, reason: string) {
+  const head = answer.replace(/\s+/g, ' ').trim().slice(0, 80)
+  const state = reason === 'answer' ? '完成了' : reason === 'aborted' ? '被中断了' : '出错结束了'
+  return { title: `Claude ${state}（用时 ${formatDuration(durationMs)}）`, body: head || '回到终端查看结果' }
+}
+
+// 单引号字符串转义：PowerShell 写两个 '，sh 用 '\''
+const psq = (s: string) => `'${s.replace(/'/g, "''")}'`
+const shq = (s: string) => `'${s.replace(/'/g, `'\''`)}'`
+
+// 系统通知 + 提示音：Windows 托盘气泡，macOS osascript，Linux notify-send
+export function notifyArgv(title: string, body: string, isWindows: boolean) {
+  if (isWindows) {
+    const ps =
+      'Add-Type -AssemblyName System.Windows.Forms,System.Drawing;' +
+      '$n=New-Object System.Windows.Forms.NotifyIcon;$n.Icon=[System.Drawing.SystemIcons]::Information;$n.Visible=$true;' +
+      `$n.ShowBalloonTip(8000,${psq(title)},${psq(body)},'Info');[System.Media.SystemSounds]::Asterisk.Play();` +
+      'Start-Sleep -Seconds 8;$n.Dispose()'
+    return ['powershell.exe', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', ps]
+  }
+  const osa = `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)} sound name "Glass"`
+  return ['sh', '-c', `command -v osascript >/dev/null && osascript -e ${shq(osa)} || notify-send ${shq(title)} ${shq(body)}`]
 }
