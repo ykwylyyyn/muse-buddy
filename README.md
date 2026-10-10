@@ -24,6 +24,25 @@ Claude Code 终端里的动态小助手：一个 11 行高的 ASCII 小人站在
 
 按 `y` 添加市场，再按 Enter 选用户范围即可。
 
+## 更新升级
+
+在系统终端（不是 Claude 的提示框）里运行：
+
+```
+claude plugin marketplace update muse-buddy
+claude plugin update muse-buddy@muse-buddy
+```
+
+第一行拉取仓库最新的清单，第二行装上新版本。装完后重启 Claude Code 生效（已开着的会话也可以输入 `/reload-plugins`）。
+
+用 `claude plugin list` 可以查看当前装的版本号。
+
+## 卸载
+
+```
+claude plugin uninstall muse-buddy@muse-buddy
+```
+
 ## 自定义
 
 造型和配色都在 `hooks/register.tsx` 开头：`FACES`（各状态帧）、`HAIR` / `EYE` / `SHIRT`（渐变色）、`ACCENT`（星星、问号等）。帧速在 `$.clock.every(150, …)`。
