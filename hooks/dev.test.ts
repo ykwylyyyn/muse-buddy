@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 
-import { crossed, danger, parseConfig, quotas, shellArgv, tail, untilReset, usageLine, usageColor } from './dev'
+import { crossed, danger, mergeUsage, parseConfig, quotas, shellArgv, tail, untilReset, usageLine, usageColor } from './dev'
 
 const bash = (command: string) => danger('Bash', { command })
 
@@ -76,6 +76,15 @@ test('用量显示与阈值提醒', () => {
   expect(usageLine({ percent: 10, window: 200000, ...quotas([]) }, now)).toBe('上下文 10%')
   expect(untilReset('2026-10-10T00:40:00Z', now)).toBe('40分后重置')
   expect(untilReset('2026-10-09T00:00:00Z', now)).toBe('')
+  // resume 后的读数不带额度：沿用旧值；已过重置时间的旧值丢弃
+  const fresh = { percent: 5, window: 200000 }
+  const kept = mergeUsage({ window: 200000, ...q }, fresh, now)
+  expect([kept.percent, kept.fiveHour?.percent, kept.week?.percent]).toEqual([5, 30, 12.4])
+  const later = Date.parse('2026-10-10T03:00:00Z')
+  const expired = mergeUsage({ window: 200000, ...q }, fresh, later)
+  expect([expired.fiveHour, expired.week?.percent]).toEqual([undefined, 12.4])
+  // 新读数带了额度就用新的
+  expect(mergeUsage({ window: 1, ...q }, { window: 1, fiveHour: { percent: 50 } }, now).fiveHour?.percent).toBe(50)
   // 颜色看最紧的一项
   expect(usageColor({ percent: 10, window: 1, week: { percent: 92 } })).toBe('#ff5f5f')
   expect(crossed(70, 82)).toBe(80)

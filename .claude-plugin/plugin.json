@@ -1,6 +1,6 @@
 {
   "name": "muse-buddy",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "提示框上方的动态小助手，随 Claude 状态变换表情",
   "author": { "name": "ykwylyyyn" },
   "types": "./types/index.d.ts"

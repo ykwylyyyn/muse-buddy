@@ -98,6 +98,19 @@ export function quotas(limits: { kind: string; percentUsed: number; resetsAt?: s
   return { fiveHour: pick('five_hour'), week: pick('seven_day') }
 }
 
+// 额度窗口过了重置时间就作废
+const alive = (q: Quota | undefined, now: number) =>
+  q && (!q.resetsAt || Date.parse(q.resetsAt) > now) ? q : undefined
+
+// 合并一次新读数：上下文、费用以新读数为准；新读数没带额度时（如 resume 后第一次）沿用旧的有效额度
+export function mergeUsage(before: Usage | null | undefined, reading: Usage, now: number): Usage {
+  return {
+    ...reading,
+    fiveHour: reading.fiveHour ?? alive(before?.fiveHour, now),
+    week: reading.week ?? alive(before?.week, now),
+  }
+}
+
 export function usageLine(u: Usage | null, now = 0) {
   if (!u) return ''
   const parts: string[] = []

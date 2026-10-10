@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Buddy, Mood, Task, Usage } from '../types'
 import { applyTool, openTasks, reminder, summary, window } from './tasks'
-import { EDIT_TOOLS, checkFailed, crossed, danger, denied, parseConfig, quotas, shellArgv, usageColor, usageLine } from './dev'
+import { EDIT_TOOLS, checkFailed, crossed, danger, denied, mergeUsage, parseConfig, quotas, shellArgv, usageColor, usageLine } from './dev'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
 const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
@@ -254,6 +254,30 @@ async function syncTasks($: EngineInterface) {
   }
 }
 
+type Reading = {
+  context: { percent?: number; tokens?: number; window: number }
+  rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]
+  cost?: { usd: number }
+}
+
+// 记下一次用量读数并返回前后两份；额度另存到跨会话存储，resume / 新会话一开就能显示
+async function recordUsage($: EngineInterface, r: Reading) {
+  const now = await $.clock.now()
+  const before = await read($, usage)
+  const stored = before ?? ((await $.store.get('usage')) as Usage | undefined)
+  const reading: Usage = {
+    percent: r.context.percent,
+    tokens: r.context.tokens,
+    window: r.context.window,
+    usd: r.cost?.usd,
+    ...quotas(r.rateLimits),
+  }
+  const after = mergeUsage(stored, reading, now)
+  await update($, usage, () => after)
+  if (after.fiveHour || after.week) await $.store.set('usage', { window: after.window, fiveHour: after.fiveHour, week: after.week })
+  return { before, after }
+}
+
 // 本轮之后改过代码、检查还没通过
 let isDirty = false
 let checkNags = 0
@@ -282,15 +306,7 @@ ${r.stderr}`)
 export const register: Register = on => {
   // 功能3：用量变化时记下，跨过 80% / 90% 提醒
   on('session.measure', async ($, e, next) => {
-    const before = await read($, usage)
-    const now: Usage = {
-      percent: e.context.percent,
-      tokens: e.context.tokens,
-      window: e.context.window,
-      usd: e.cost?.usd,
-      ...quotas(e.rateLimits),
-    }
-    await update($, usage, () => now)
+    const { before, after: now } = await recordUsage($, e)
     const t = crossed(before?.percent, now.percent)
     if (t) $.ui.toast(`上下文已用 ${t}%：建议先 /compact 压缩或开新会话`)
     const t5 = crossed(before?.fiveHour?.percent, now.fiveHour?.percent)
@@ -304,6 +320,12 @@ export const register: Register = on => {
     animate($)
     // 很多会话没有 TodoWrite / TaskCreate，自带一个记任务的工具
     await $.tool.register(TASKS_TOOL)
+    // resume 时引擎不一定马上推送用量：先主动读一次，读不到额度就用上次存下的
+    try {
+      await recordUsage($, await $.session.usage())
+    } catch {
+      // 会话还没绑定好等情况：等下一次 session.measure
+    }
     return next(e)
   })
 
