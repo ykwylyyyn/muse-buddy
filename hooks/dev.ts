@@ -1,5 +1,5 @@
 // 开发守卫的纯逻辑：检查命令、危险操作识别、用量格式化。不碰 $，方便测试
-import type { Usage } from '../types'
+import type { Quota, Usage } from '../types'
 
 // ---------- 功能1：改完代码后的检查 ----------
 
@@ -73,12 +73,37 @@ export const denied = (why: string) =>
 
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
-export function usageLine(u: Usage | null) {
+// 距重置还有多久：≥1 天显示天+小时，否则小时+分钟
+export function untilReset(resetsAt: string | undefined, now: number) {
+  const ms = resetsAt ? Date.parse(resetsAt) - now : NaN
+  if (!(ms > 0)) return ''
+  const m = Math.round(ms / 60000)
+  const d = Math.floor(m / 1440)
+  const h = Math.floor((m % 1440) / 60)
+  return d ? `${d}天${h}时后重置` : h ? `${h}时${m % 60}分后重置` : `${m % 60}分后重置`
+}
+
+const quota = (name: string, q: Quota | undefined, now: number) => {
+  if (!q) return ''
+  const left = untilReset(q.resetsAt, now)
+  return `${name} ${Math.round(q.percent)}%${left ? `（${left}）` : ''}`
+}
+
+// 从 rateLimits 里分出 5 小时窗口和周窗口
+export function quotas(limits: { kind: string; percentUsed: number; resetsAt?: string }[]) {
+  const pick = (kind: string) => {
+    const l = limits.find(x => x.kind === kind)
+    return l ? { percent: l.percentUsed, resetsAt: l.resetsAt } : undefined
+  }
+  return { fiveHour: pick('five_hour'), week: pick('seven_day') }
+}
+
+export function usageLine(u: Usage | null, now = 0) {
   if (!u) return ''
   const parts: string[] = []
   if (u.percent !== undefined) parts.push(`上下文 ${Math.round(u.percent)}%${u.tokens ? `（${k(u.tokens)}/${k(u.window)}）` : ''}`)
   if (u.usd !== undefined) parts.push(`$${u.usd.toFixed(2)}`)
-  if (u.limit !== undefined) parts.push(`额度 ${Math.round(u.limit)}%`)
+  for (const q of [quota('5h额度', u.fiveHour, now), quota('周额度', u.week, now)]) if (q) parts.push(q)
   return parts.join(' · ')
 }
 
@@ -86,5 +111,8 @@ export function usageLine(u: Usage | null) {
 export const crossed = (before: number | undefined, after: number | undefined) =>
   [80, 90].find(t => (before ?? 0) < t && (after ?? 0) >= t)
 
-export const usageColor = (u: Usage | null) =>
-  (u?.percent ?? 0) >= 90 ? '#ff5f5f' : (u?.percent ?? 0) >= 80 ? '#ffaf00' : '#8a8a8a'
+// 颜色看最紧的那一项
+export const usageColor = (u: Usage | null) => {
+  const worst = Math.max(u?.percent ?? 0, u?.fiveHour?.percent ?? 0, u?.week?.percent ?? 0)
+  return worst >= 90 ? '#ff5f5f' : worst >= 80 ? '#ffaf00' : '#8a8a8a'
+}

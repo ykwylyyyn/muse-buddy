@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Buddy, Mood, Task, Usage } from '../types'
 import { applyTool, openTasks, reminder, summary, window } from './tasks'
-import { EDIT_TOOLS, checkFailed, crossed, danger, denied, parseConfig, shellArgv, usageColor, usageLine } from './dev'
+import { EDIT_TOOLS, checkFailed, crossed, danger, denied, parseConfig, quotas, shellArgv, usageColor, usageLine } from './dev'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
 const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
@@ -283,11 +283,20 @@ export const register: Register = on => {
   // 功能3：用量变化时记下，跨过 80% / 90% 提醒
   on('session.measure', async ($, e, next) => {
     const before = await read($, usage)
-    const limit = e.rateLimits.length ? Math.max(...e.rateLimits.map(l => l.percentUsed)) : undefined
-    const now: Usage = { percent: e.context.percent, tokens: e.context.tokens, window: e.context.window, usd: e.cost?.usd, limit }
+    const now: Usage = {
+      percent: e.context.percent,
+      tokens: e.context.tokens,
+      window: e.context.window,
+      usd: e.cost?.usd,
+      ...quotas(e.rateLimits),
+    }
     await update($, usage, () => now)
     const t = crossed(before?.percent, now.percent)
     if (t) $.ui.toast(`上下文已用 ${t}%：建议先 /compact 压缩或开新会话`)
+    const t5 = crossed(before?.fiveHour?.percent, now.fiveHour?.percent)
+    if (t5) $.ui.toast(`5 小时额度已用 ${t5}%`)
+    const tw = crossed(before?.week?.percent, now.week?.percent)
+    if (tw) $.ui.toast(`周额度已用 ${tw}%`)
     return next(e)
   })
 
@@ -382,7 +391,8 @@ export const register: Register = on => {
 
     const list = await read($, tasks)
     const u = await read($, usage)
-    const meter = usageLine(u)
+    // 只有要算“几时后重置”时才读时钟
+    const meter = usageLine(u, u?.fiveHour?.resetsAt || u?.week?.resetsAt ? await $.clock.now() : 0)
     const done = list.length - openTasks(list).length
     const tally = list.length ? `任务 ${done}/${list.length}` : ''
 

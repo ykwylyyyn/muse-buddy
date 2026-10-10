@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 
-import { crossed, danger, parseConfig, shellArgv, tail, usageLine } from './dev'
+import { crossed, danger, parseConfig, quotas, shellArgv, tail, untilReset, usageLine, usageColor } from './dev'
 
 const bash = (command: string) => danger('Bash', { command })
 
@@ -64,9 +64,20 @@ test('检查配置解析与 shell 选择', () => {
 
 test('用量显示与阈值提醒', () => {
   expect(usageLine(null)).toBe('')
-  expect(usageLine({ percent: 45.4, tokens: 90000, window: 200000, usd: 0.321, limit: 30 })).toBe(
-    '上下文 45%（90k/200k） · $0.32 · 额度 30%',
+  const now = Date.parse('2026-10-10T00:00:00Z')
+  const q = quotas([
+    { kind: 'five_hour', percentUsed: 30, resetsAt: '2026-10-10T02:15:00Z' },
+    { kind: 'seven_day', percentUsed: 12.4, resetsAt: '2026-10-13T05:00:00Z' },
+  ])
+  expect(usageLine({ percent: 45.4, tokens: 90000, window: 200000, usd: 0.321, ...q }, now)).toBe(
+    '上下文 45%（90k/200k） · $0.32 · 5h额度 30%（2时15分后重置） · 周额度 12%（3天5时后重置）',
   )
+  // 没有订阅额度数据时不显示
+  expect(usageLine({ percent: 10, window: 200000, ...quotas([]) }, now)).toBe('上下文 10%')
+  expect(untilReset('2026-10-10T00:40:00Z', now)).toBe('40分后重置')
+  expect(untilReset('2026-10-09T00:00:00Z', now)).toBe('')
+  // 颜色看最紧的一项
+  expect(usageColor({ percent: 10, window: 1, week: { percent: 92 } })).toBe('#ff5f5f')
   expect(crossed(70, 82)).toBe(80)
   expect(crossed(85, 91)).toBe(90)
   expect(crossed(81, 85)).toBe(undefined)
