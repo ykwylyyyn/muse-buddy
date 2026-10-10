@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Buddy, Mood, Task } from '../types'
-import { applyTool, openTasks, reminder, window } from './tasks'
+import { applyTool, openTasks, reminder, summary, window } from './tasks'
 
 const buddy = atom({ plugin: 'muse-buddy', key: 'buddy' } as const, { mood: 'idle', frame: 0, tool: '' } as Buddy)
 const tasks = atom({ plugin: 'muse-buddy', key: 'tasks' } as const, [] as Task[])
@@ -211,6 +211,33 @@ function rest4s($: EngineInterface) {
   rest = $.clock.after(4000, () => setMood($, 'idle'))
 }
 
+const TASKS_TOOL_ID = 'mcp__muse-buddy__tasks'
+const TASKS_TOOL = {
+  name: 'tasks',
+  description:
+    '任务清单（显示在用户终端上，结束回复前会被检查）。做任何多步骤任务时：开始先用它写下完整清单，' +
+    '每开始一项标 in_progress，做完一项立刻标 completed。每次调用传完整清单（整表替换）。' +
+    '结束回复前所有项都必须是 completed；不再需要的项直接从清单里去掉。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      todos: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            content: { type: 'string', description: '任务内容' },
+            status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+          },
+          required: ['content', 'status'],
+        },
+      },
+    },
+    required: ['todos'],
+  },
+  isDeferred: false,
+}
+
 // 同一轮最多把 agent 推回去几次，防止它卡住时无限循环
 const MAX_NAGS = 3
 let nags = 0
@@ -226,8 +253,10 @@ async function syncTasks($: EngineInterface) {
 }
 
 export const register: Register = on => {
-  on('session.start', ($, e, next) => {
+  on('session.start', async ($, e, next) => {
     animate($)
+    // 很多会话没有 TodoWrite / TaskCreate，自带一个记任务的工具
+    await $.tool.register(TASKS_TOOL)
     return next(e)
   })
 
@@ -244,6 +273,11 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
+    // 自带任务工具：整表替换，回给模型当前清单（名字是运行时注册的，不在内置工具类型里）
+    if ((e.tool as string) === TASKS_TOOL_ID) {
+      const list = await update($, tasks, ts => applyTool(ts, 'TodoWrite', e, {}))
+      return { result: summary(list) }
+    }
     // 自己在 Stop 时实查用的 TaskList 不算小人的动作
     const quiet = e.tool === 'TaskList'
     if (!quiet) await setMood($, 'tool', e.tool)

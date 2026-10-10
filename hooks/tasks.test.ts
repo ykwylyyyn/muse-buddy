@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 
-import { applyTool, openTasks, reminder, window } from './tasks'
+import { applyTool, openTasks, reminder, summary, window } from './tasks'
 
 const todo = (content: string, status: 'pending' | 'in_progress' | 'completed') => ({ content, status, activeForm: content })
 
@@ -25,6 +25,16 @@ test('提醒文本列出每个未完成项', () => {
   const text = reminder([{ id: '1', subject: '写测试', status: 'pending' }])
   expect(text.includes('还有 1 项')).toBe(true)
   expect(text.includes('- [ ] 写测试')).toBe(true)
+})
+
+test('摘要标出完成情况', () => {
+  const text = summary([
+    { id: '1', subject: 'A', status: 'completed' },
+    { id: '2', subject: 'B', status: 'in_progress' },
+  ])
+  expect(text.includes('- [x] A')).toBe(true)
+  expect(text.includes('- [~] B')).toBe(true)
+  expect(text.includes('未完成 1 项')).toBe(true)
 })
 
 test('长清单窗口停在第一个未完成项附近', () => {
@@ -54,5 +64,18 @@ test('Stop 时有未完成项就推回 agent，最多 3 次；全部完成就放
 
   await $.prompt.submit({ text: '继续' } as never)
   await $.tool.call({ tool: 'TodoWrite', todos: [todo('A', 'completed'), todo('B', 'completed')] })
+  expect((await $.classic.Stop({ stop_hook_active: false })).block).toBe(undefined)
+})
+
+test('自带 tasks 工具：记下清单、回给模型摘要，Stop 时据此提醒', async ($, on) => {
+  on('classic.Stop', () => ({}))
+  on('ui.toast', () => ({ value: undefined }) as never)
+
+  const r = await $.tool.call({ tool: 'mcp__muse-buddy__tasks', todos: [todo('写接口', 'completed'), todo('写测试', 'pending')] } as never)
+  expect(String((r as { result?: unknown }).result).includes('未完成 1 项')).toBe(true)
+  const stop = await $.classic.Stop({ stop_hook_active: false })
+  expect((stop.block ?? '').includes('- [ ] 写测试')).toBe(true)
+
+  await $.tool.call({ tool: 'mcp__muse-buddy__tasks', todos: [todo('写接口', 'completed'), todo('写测试', 'completed')] } as never)
   expect((await $.classic.Stop({ stop_hook_active: false })).block).toBe(undefined)
 })
