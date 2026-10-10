@@ -1,0 +1,6 @@
+{
+  "name": "muse-buddy",
+  "owner": { "name": "ykwylyyyn" },
+  "description": "Claude Code 终端动态小助手",
+  "plugins": [{ "name": "muse-buddy", "source": "./" }]
+}
